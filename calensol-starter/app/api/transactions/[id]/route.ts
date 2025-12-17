@@ -3,122 +3,164 @@ import { createAdminClient } from '@/lib/supabase/server';
 import { deleteCalendarEvent, updateEventTime } from '@/lib/calendar';
 import { getValidAccessToken } from '@/lib/google';
 import { z } from 'zod';
+import { isValidSolanaAddress } from '@/lib/validation/solana';
+import {
+  checkRateLimit,
+  rateLimitedResponse,
+  getClientIP,
+  addSecurityHeaders,
+  authenticateWallet,
+} from '@/lib/auth/middleware';
+
+interface RouteParams {
+  params: Promise<{ id: string }>;
+}
 
 // Validation schema for updates
 const UpdateTransactionSchema = z.object({
+  walletAddress: z.string().refine(isValidSolanaAddress, 'Invalid wallet address'),
   scheduledAt: z.string().datetime().optional(),
   amount: z.number().positive().optional(),
   recipient: z.string().optional(),
   status: z.enum(['pending', 'cancelled']).optional(),
-  memo: z.string().optional(),
+  memo: z.string().max(256).optional(),
 });
 
 // GET /api/transactions/[id] - Get a specific transaction
-export async function GET(
-  request: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
+export async function GET(request: NextRequest, { params }: RouteParams) {
   const { id } = await params;
+  const clientIP = getClientIP(request);
+
+  // Rate limiting
+  const rateLimit = checkRateLimit(`tx-get-${clientIP}`, 100, 60000);
+  if (!rateLimit.allowed) {
+    return rateLimitedResponse(rateLimit.resetAt);
+  }
+
   const searchParams = request.nextUrl.searchParams;
   const walletAddress = searchParams.get('wallet');
 
   if (!walletAddress) {
-    return NextResponse.json(
-      { error: 'Wallet address is required' },
-      { status: 400 }
+    return addSecurityHeaders(
+      NextResponse.json({ error: 'Wallet address is required' }, { status: 400 })
+    );
+  }
+
+  if (!isValidSolanaAddress(walletAddress)) {
+    return addSecurityHeaders(
+      NextResponse.json({ error: 'Invalid wallet address' }, { status: 400 })
+    );
+  }
+
+  // Authenticate
+  const auth = await authenticateWallet(walletAddress);
+  if (!auth.authenticated) {
+    return addSecurityHeaders(
+      NextResponse.json({ error: auth.error }, { status: auth.error === 'User not found' ? 404 : 400 })
     );
   }
 
   const supabase = createAdminClient();
-
-  // Get user
-  const { data: user } = await supabase
-    .from('users')
-    .select('id')
-    .eq('smart_wallet_pubkey', walletAddress)
-    .single();
-
-  if (!user) {
-    return NextResponse.json(
-      { error: 'User not found' },
-      { status: 404 }
-    );
-  }
 
   // Get transaction
   const { data: transaction, error } = await supabase
     .from('scheduled_transactions')
     .select('*')
     .eq('id', id)
-    .eq('user_id', user.id)
+    .eq('user_id', auth.userId)
     .single();
 
   if (error || !transaction) {
-    return NextResponse.json(
-      { error: 'Transaction not found' },
-      { status: 404 }
+    return addSecurityHeaders(
+      NextResponse.json({ error: 'Transaction not found' }, { status: 404 })
     );
   }
 
-  return NextResponse.json({ transaction });
+  return addSecurityHeaders(NextResponse.json({ transaction }));
 }
 
 // PATCH /api/transactions/[id] - Update a transaction
-export async function PATCH(
-  request: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  try {
-    const { id } = await params;
-    const body = await request.json();
-    const { walletAddress, ...updateData } = body;
+export async function PATCH(request: NextRequest, { params }: RouteParams) {
+  const { id } = await params;
+  const clientIP = getClientIP(request);
 
-    if (!walletAddress) {
-      return NextResponse.json(
-        { error: 'Wallet address is required' },
-        { status: 400 }
+  // Rate limiting
+  const rateLimit = checkRateLimit(`tx-patch-${clientIP}`, 30, 60000);
+  if (!rateLimit.allowed) {
+    return rateLimitedResponse(rateLimit.resetAt);
+  }
+
+  try {
+    const body = await request.json();
+
+    // Validate input
+    const validationResult = UpdateTransactionSchema.safeParse(body);
+    if (!validationResult.success) {
+      return addSecurityHeaders(
+        NextResponse.json(
+          { error: 'Invalid input', details: validationResult.error.errors },
+          { status: 400 }
+        )
       );
     }
 
-    // Validate input
-    const data = UpdateTransactionSchema.parse(updateData);
+    const { walletAddress, ...updateData } = validationResult.data;
+
+    // Authenticate
+    const auth = await authenticateWallet(walletAddress);
+    if (!auth.authenticated) {
+      return addSecurityHeaders(
+        NextResponse.json({ error: auth.error }, { status: 404 })
+      );
+    }
 
     const supabase = createAdminClient();
 
-    // Get user
+    // Get user data for calendar operations
     const { data: user } = await supabase
       .from('users')
       .select('*')
-      .eq('smart_wallet_pubkey', walletAddress)
+      .eq('id', auth.userId)
       .single();
-
-    if (!user) {
-      return NextResponse.json(
-        { error: 'User not found' },
-        { status: 404 }
-      );
-    }
 
     // Get existing transaction
     const { data: existingTx } = await supabase
       .from('scheduled_transactions')
       .select('*')
       .eq('id', id)
-      .eq('user_id', user.id)
+      .eq('user_id', auth.userId)
       .single();
 
     if (!existingTx) {
-      return NextResponse.json(
-        { error: 'Transaction not found' },
-        { status: 404 }
+      return addSecurityHeaders(
+        NextResponse.json({ error: 'Transaction not found' }, { status: 404 })
       );
     }
 
     // Only allow updates if transaction is pending
     if (existingTx.status !== 'pending') {
-      return NextResponse.json(
-        { error: 'Can only update pending transactions' },
-        { status: 400 }
+      return addSecurityHeaders(
+        NextResponse.json(
+          { error: 'Can only update pending transactions' },
+          { status: 400 }
+        )
+      );
+    }
+
+    // Validate recipient address if provided
+    if (updateData.recipient && !isValidSolanaAddress(updateData.recipient)) {
+      return addSecurityHeaders(
+        NextResponse.json({ error: 'Invalid recipient address' }, { status: 400 })
+      );
+    }
+
+    // Validate scheduled time is in the future
+    if (updateData.scheduledAt && new Date(updateData.scheduledAt) <= new Date()) {
+      return addSecurityHeaders(
+        NextResponse.json(
+          { error: 'Scheduled time must be in the future' },
+          { status: 400 }
+        )
       );
     }
 
@@ -127,14 +169,14 @@ export async function PATCH(
       updated_at: new Date().toISOString(),
     };
 
-    if (data.scheduledAt) {
-      updateObj.scheduled_at = data.scheduledAt;
-      updateObj.next_execution_at = data.scheduledAt;
+    if (updateData.scheduledAt) {
+      updateObj.scheduled_at = updateData.scheduledAt;
+      updateObj.next_execution_at = updateData.scheduledAt;
     }
-    if (data.amount !== undefined) updateObj.amount = data.amount;
-    if (data.recipient !== undefined) updateObj.to_pubkey = data.recipient;
-    if (data.status !== undefined) updateObj.status = data.status;
-    if (data.memo !== undefined) updateObj.memo = data.memo;
+    if (updateData.amount !== undefined) updateObj.amount = updateData.amount;
+    if (updateData.recipient !== undefined) updateObj.to_pubkey = updateData.recipient;
+    if (updateData.status !== undefined) updateObj.status = updateData.status;
+    if (updateData.memo !== undefined) updateObj.memo = updateData.memo;
 
     // Update transaction
     const { data: transaction, error } = await supabase
@@ -145,14 +187,18 @@ export async function PATCH(
       .single();
 
     if (error) {
-      return NextResponse.json(
-        { error: 'Failed to update transaction' },
-        { status: 500 }
+      console.error('Failed to update transaction:', error);
+      return addSecurityHeaders(
+        NextResponse.json({ error: 'Failed to update transaction' }, { status: 500 })
       );
     }
 
     // Update calendar event if time changed
-    if (data.scheduledAt && existingTx.google_event_id && user.google_refresh_token) {
+    if (
+      updateData.scheduledAt &&
+      existingTx.google_event_id &&
+      user?.google_refresh_token
+    ) {
       try {
         const tokenData = await getValidAccessToken(
           user.google_access_token,
@@ -165,7 +211,7 @@ export async function PATCH(
             tokenData.accessToken,
             user.google_refresh_token,
             existingTx.google_event_id,
-            new Date(data.scheduledAt)
+            new Date(updateData.scheduledAt)
           );
         }
       } catch (calError) {
@@ -173,37 +219,56 @@ export async function PATCH(
       }
     }
 
-    return NextResponse.json({ transaction });
+    return addSecurityHeaders(NextResponse.json({ transaction }));
   } catch (error) {
     console.error('Update transaction error:', error);
 
     if (error instanceof z.ZodError) {
-      return NextResponse.json(
-        { error: 'Invalid input', details: error.errors },
-        { status: 400 }
+      return addSecurityHeaders(
+        NextResponse.json(
+          { error: 'Invalid input', details: error.errors },
+          { status: 400 }
+        )
       );
     }
 
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
+    return addSecurityHeaders(
+      NextResponse.json({ error: 'Internal server error' }, { status: 500 })
     );
   }
 }
 
 // DELETE /api/transactions/[id] - Cancel/delete a transaction
-export async function DELETE(
-  request: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
+export async function DELETE(request: NextRequest, { params }: RouteParams) {
   const { id } = await params;
+  const clientIP = getClientIP(request);
+
+  // Rate limiting
+  const rateLimit = checkRateLimit(`tx-delete-${clientIP}`, 20, 60000);
+  if (!rateLimit.allowed) {
+    return rateLimitedResponse(rateLimit.resetAt);
+  }
+
   const searchParams = request.nextUrl.searchParams;
   const walletAddress = searchParams.get('wallet');
 
   if (!walletAddress) {
-    return NextResponse.json(
-      { error: 'Wallet address is required' },
-      { status: 400 }
+    return addSecurityHeaders(
+      NextResponse.json({ error: 'Wallet address is required' }, { status: 400 })
+    );
+  }
+
+  if (!isValidSolanaAddress(walletAddress)) {
+    return addSecurityHeaders(
+      NextResponse.json({ error: 'Invalid wallet address' }, { status: 400 })
+    );
+  }
+
+  // Authenticate
+  const auth = await authenticateWallet(walletAddress);
+  if (!auth.authenticated) {
+    return addSecurityHeaders(
+      NextResponse.json({ error: auth.error }, { status: auth.error === 'User not found' ? 404 : 400 })
     );
   }
 
@@ -213,41 +278,43 @@ export async function DELETE(
   const { data: user } = await supabase
     .from('users')
     .select('*')
-    .eq('smart_wallet_pubkey', walletAddress)
+    .eq('id', auth.userId)
     .single();
-
-  if (!user) {
-    return NextResponse.json(
-      { error: 'User not found' },
-      { status: 404 }
-    );
-  }
 
   // Get transaction
   const { data: transaction } = await supabase
     .from('scheduled_transactions')
     .select('*')
     .eq('id', id)
-    .eq('user_id', user.id)
+    .eq('user_id', auth.userId)
     .single();
 
   if (!transaction) {
-    return NextResponse.json(
-      { error: 'Transaction not found' },
-      { status: 404 }
+    return addSecurityHeaders(
+      NextResponse.json({ error: 'Transaction not found' }, { status: 404 })
     );
   }
 
   // Only allow deletion if transaction is pending or failed
   if (!['pending', 'failed', 'cancelled'].includes(transaction.status)) {
-    return NextResponse.json(
-      { error: 'Cannot delete transaction in current status' },
-      { status: 400 }
+    return addSecurityHeaders(
+      NextResponse.json(
+        { error: 'Cannot delete transaction in current status' },
+        { status: 400 }
+      )
     );
   }
 
+  // Release nonce account if one was assigned
+  if (transaction.nonce_account_id) {
+    await supabase
+      .from('nonce_accounts')
+      .update({ is_available: true })
+      .eq('id', transaction.nonce_account_id);
+  }
+
   // Delete calendar event if exists
-  if (transaction.google_event_id && user.google_refresh_token) {
+  if (transaction.google_event_id && user?.google_refresh_token) {
     try {
       const tokenData = await getValidAccessToken(
         user.google_access_token,
@@ -274,11 +341,11 @@ export async function DELETE(
     .eq('id', id);
 
   if (error) {
-    return NextResponse.json(
-      { error: 'Failed to delete transaction' },
-      { status: 500 }
+    console.error('Failed to delete transaction:', error);
+    return addSecurityHeaders(
+      NextResponse.json({ error: 'Failed to delete transaction' }, { status: 500 })
     );
   }
 
-  return NextResponse.json({ success: true });
+  return addSecurityHeaders(NextResponse.json({ success: true }));
 }

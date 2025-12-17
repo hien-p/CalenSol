@@ -3,103 +3,175 @@ import { createAdminClient } from '@/lib/supabase/server';
 import { createCalendarEvent, generateEventTitle } from '@/lib/calendar';
 import { getValidAccessToken } from '@/lib/google';
 import { z } from 'zod';
-import type { CreateTransactionRequest, TransactionType } from '@/types';
-
-// Validation schema
-const CreateTransactionSchema = z.object({
-  type: z.enum(['transfer', 'swap', 'stake']),
-  scheduledAt: z.string().datetime(),
-  amount: z.number().positive(),
-  tokenMint: z.string().optional(),
-  recipient: z.string().optional(),
-  inputMint: z.string().optional(),
-  outputMint: z.string().optional(),
-  slippageBps: z.number().min(0).max(10000).optional(),
-  recurrenceRule: z.string().optional(),
-  memo: z.string().optional(),
-});
+import {
+  createTransactionSchema,
+  getTransactionsQuerySchema,
+} from '@/lib/validation/schemas';
+import { isValidSolanaAddress } from '@/lib/validation/solana';
+import {
+  checkRateLimit,
+  rateLimitedResponse,
+  getClientIP,
+  addSecurityHeaders,
+  authenticateWallet,
+} from '@/lib/auth/middleware';
 
 // GET /api/transactions - List user's scheduled transactions
 export async function GET(request: NextRequest) {
-  const searchParams = request.nextUrl.searchParams;
-  const walletAddress = searchParams.get('wallet');
-  const status = searchParams.get('status');
+  const clientIP = getClientIP(request);
 
-  if (!walletAddress) {
-    return NextResponse.json(
-      { error: 'Wallet address is required' },
-      { status: 400 }
+  // Rate limiting: 100 requests per minute per IP
+  const rateLimit = checkRateLimit(`transactions-get-${clientIP}`, 100, 60000);
+  if (!rateLimit.allowed) {
+    return rateLimitedResponse(rateLimit.resetAt);
+  }
+
+  const searchParams = request.nextUrl.searchParams;
+
+  // Validate query parameters
+  const queryResult = getTransactionsQuerySchema.safeParse({
+    wallet: searchParams.get('wallet'),
+    status: searchParams.get('status'),
+    limit: searchParams.get('limit'),
+    offset: searchParams.get('offset'),
+  });
+
+  if (!queryResult.success) {
+    return addSecurityHeaders(
+      NextResponse.json(
+        { error: 'Invalid parameters', details: queryResult.error.errors },
+        { status: 400 }
+      )
+    );
+  }
+
+  const { wallet, status, limit, offset } = queryResult.data;
+
+  // Authenticate wallet
+  const auth = await authenticateWallet(wallet);
+  if (!auth.authenticated) {
+    return addSecurityHeaders(
+      NextResponse.json({ error: auth.error }, { status: auth.error === 'User not found' ? 404 : 400 })
     );
   }
 
   const supabase = createAdminClient();
 
-  // Get user
-  const { data: user, error: userError } = await supabase
-    .from('users')
-    .select('id')
-    .eq('smart_wallet_pubkey', walletAddress)
-    .single();
-
-  if (userError || !user) {
-    return NextResponse.json(
-      { error: 'User not found' },
-      { status: 404 }
-    );
-  }
-
-  // Build query
+  // Build query with pagination
   let query = supabase
     .from('scheduled_transactions')
-    .select('*')
-    .eq('user_id', user.id)
-    .order('scheduled_at', { ascending: true });
+    .select('*', { count: 'exact' })
+    .eq('user_id', auth.userId)
+    .order('scheduled_at', { ascending: true })
+    .range(offset, offset + limit - 1);
 
   if (status) {
     query = query.eq('status', status);
   }
 
-  const { data: transactions, error } = await query;
+  const { data: transactions, error, count } = await query;
 
   if (error) {
-    return NextResponse.json(
-      { error: error.message },
-      { status: 500 }
+    console.error('Failed to fetch transactions:', error);
+    return addSecurityHeaders(
+      NextResponse.json({ error: 'Failed to fetch transactions' }, { status: 500 })
     );
   }
 
-  return NextResponse.json({ transactions: transactions || [] });
+  return addSecurityHeaders(
+    NextResponse.json({
+      transactions: transactions || [],
+      pagination: {
+        total: count || 0,
+        limit,
+        offset,
+        hasMore: (count || 0) > offset + limit,
+      },
+    })
+  );
 }
 
 // POST /api/transactions - Create a new scheduled transaction
 export async function POST(request: NextRequest) {
+  const clientIP = getClientIP(request);
+
+  // Rate limiting: 20 creates per minute per IP
+  const rateLimit = checkRateLimit(`transactions-post-${clientIP}`, 20, 60000);
+  if (!rateLimit.allowed) {
+    return rateLimitedResponse(rateLimit.resetAt);
+  }
+
   try {
     const body = await request.json();
-    const { walletAddress, ...transactionData } = body;
 
-    if (!walletAddress) {
-      return NextResponse.json(
-        { error: 'Wallet address is required' },
-        { status: 400 }
+    // Validate input with comprehensive schema
+    const validationResult = createTransactionSchema.safeParse(body);
+
+    if (!validationResult.success) {
+      return addSecurityHeaders(
+        NextResponse.json(
+          { error: 'Invalid input', details: validationResult.error.errors },
+          { status: 400 }
+        )
       );
     }
 
-    // Validate input
-    const data = CreateTransactionSchema.parse(transactionData);
+    const data = validationResult.data;
+
+    // Additional validation for transfer type
+    if (data.type === 'transfer' && !data.recipient) {
+      return addSecurityHeaders(
+        NextResponse.json(
+          { error: 'Recipient address is required for transfers' },
+          { status: 400 }
+        )
+      );
+    }
+
+    // Validate recipient address format if provided
+    if (data.recipient && !isValidSolanaAddress(data.recipient)) {
+      return addSecurityHeaders(
+        NextResponse.json(
+          { error: 'Invalid recipient address format' },
+          { status: 400 }
+        )
+      );
+    }
+
+    // Validate scheduled time is in the future
+    const scheduledDate = new Date(data.scheduledAt);
+    if (scheduledDate <= new Date()) {
+      return addSecurityHeaders(
+        NextResponse.json(
+          { error: 'Scheduled time must be in the future' },
+          { status: 400 }
+        )
+      );
+    }
+
+    // Authenticate wallet
+    const auth = await authenticateWallet(data.walletAddress);
+    if (!auth.authenticated) {
+      return addSecurityHeaders(
+        NextResponse.json(
+          { error: auth.error || 'User not found. Please connect your Google Calendar first.' },
+          { status: 404 }
+        )
+      );
+    }
 
     const supabase = createAdminClient();
 
-    // Get user
+    // Get full user data
     const { data: user, error: userError } = await supabase
       .from('users')
       .select('*')
-      .eq('smart_wallet_pubkey', walletAddress)
+      .eq('id', auth.userId)
       .single();
 
     if (userError || !user) {
-      return NextResponse.json(
-        { error: 'User not found. Please connect your Google Calendar first.' },
-        { status: 404 }
+      return addSecurityHeaders(
+        NextResponse.json({ error: 'User not found' }, { status: 404 })
       );
     }
 
@@ -114,13 +186,13 @@ export async function POST(request: NextRequest) {
         transaction_type: data.type,
         scheduled_at: data.scheduledAt,
         next_execution_at: data.scheduledAt,
-        from_pubkey: walletAddress,
+        from_pubkey: data.walletAddress,
         to_pubkey: data.recipient || null,
         amount: data.amount,
         token_mint: data.tokenMint || null,
         input_mint: data.inputMint || null,
         output_mint: data.outputMint || null,
-        slippage_bps: data.slippageBps || 100,
+        slippage_bps: data.slippageBps,
         recurrence_rule: data.recurrenceRule || null,
         status: 'pending',
         memo: data.memo || null,
@@ -134,9 +206,8 @@ export async function POST(request: NextRequest) {
 
     if (txError) {
       console.error('Failed to create transaction:', txError);
-      return NextResponse.json(
-        { error: 'Failed to create transaction' },
-        { status: 500 }
+      return addSecurityHeaders(
+        NextResponse.json({ error: 'Failed to create transaction' }, { status: 500 })
       );
     }
 
@@ -175,7 +246,7 @@ export async function POST(request: NextRequest) {
             user.google_refresh_token,
             {
               title: eventTitle,
-              scheduledAt: new Date(data.scheduledAt),
+              scheduledAt: scheduledDate,
               transactionType: data.type,
               amount: data.amount,
               tokenSymbol,
@@ -200,29 +271,32 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    return NextResponse.json({
-      transaction: { ...transaction, google_event_id: calendarEventId },
-      calendarEventId,
-    });
+    return addSecurityHeaders(
+      NextResponse.json({
+        transaction: { ...transaction, google_event_id: calendarEventId },
+        calendarEventId,
+      })
+    );
   } catch (error) {
     console.error('Create transaction error:', error);
 
     if (error instanceof z.ZodError) {
-      return NextResponse.json(
-        { error: 'Invalid input', details: error.errors },
-        { status: 400 }
+      return addSecurityHeaders(
+        NextResponse.json(
+          { error: 'Invalid input', details: error.errors },
+          { status: 400 }
+        )
       );
     }
 
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
+    return addSecurityHeaders(
+      NextResponse.json({ error: 'Internal server error' }, { status: 500 })
     );
   }
 }
 
 // Helper to get token symbol from mint address
-function getTokenSymbol(mint?: string): string {
+function getTokenSymbol(mint?: string | null): string {
   if (!mint) return 'SOL';
   if (mint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') return 'USDC';
   if (mint === '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU') return 'USDC';

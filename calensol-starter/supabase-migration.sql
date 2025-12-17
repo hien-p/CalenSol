@@ -117,6 +117,21 @@ CREATE TABLE IF NOT EXISTS notification_preferences (
 );
 
 -- ===========================================
+-- OAuth States Table (for secure OAuth flow)
+-- ===========================================
+CREATE TABLE IF NOT EXISTS oauth_states (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  nonce VARCHAR(64) UNIQUE NOT NULL,
+  wallet_address VARCHAR(44) NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  expires_at TIMESTAMPTZ NOT NULL
+);
+
+-- Index for cleanup and lookup
+CREATE INDEX IF NOT EXISTS idx_oauth_states_nonce ON oauth_states(nonce);
+CREATE INDEX IF NOT EXISTS idx_oauth_states_expires_at ON oauth_states(expires_at);
+
+-- ===========================================
 -- Indexes for Performance
 -- ===========================================
 CREATE INDEX IF NOT EXISTS idx_scheduled_transactions_status 

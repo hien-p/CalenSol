@@ -5,18 +5,25 @@ import { getValidAccessToken } from '@/lib/google';
 import {
   sendPresignedTransaction,
   confirmTransaction,
-  getConnection,
+  isNonceValid,
+  fetchNonce,
 } from '@/lib/solana/nonce';
+import { PublicKey } from '@solana/web3.js';
+import { verifyCronSecret, addSecurityHeaders } from '@/lib/auth/middleware';
+
+// Execution lock tracking (in-memory, use Redis in production)
+const executingTransactions = new Set<string>();
 
 // GET /api/cron/execute - Execute pending scheduled transactions
 // This endpoint is called by Vercel Cron every minute
 export async function GET(request: NextRequest) {
-  // Verify cron secret for security
-  const authHeader = request.headers.get('authorization');
-  const cronSecret = process.env.CRON_SECRET;
-
-  if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  // Verify cron secret with constant-time comparison
+  // IMPORTANT: This will FAIL if CRON_SECRET is not configured (no bypass)
+  if (!verifyCronSecret(request)) {
+    console.error('[Cron] Unauthorized access attempt');
+    return addSecurityHeaders(
+      NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    );
   }
 
   const supabase = createAdminClient();
@@ -24,7 +31,8 @@ export async function GET(request: NextRequest) {
 
   console.log(`[Cron] Starting execution check at ${now.toISOString()}`);
 
-  // Get pending transactions that are due for execution
+  // Get transactions that are ready for execution
+  // Priority: 'ready' (pre-signed) > 'pending' (legacy)
   const { data: transactions, error } = await supabase
     .from('scheduled_transactions')
     .select(
@@ -36,40 +44,72 @@ export async function GET(request: NextRequest) {
         google_access_token,
         google_refresh_token,
         google_token_expiry
+      ),
+      nonce_accounts (
+        id,
+        pubkey,
+        current_nonce
       )
     `
     )
-    .eq('status', 'pending')
+    .in('status', ['ready', 'pending'])
     .lte('scheduled_at', now.toISOString())
     .order('scheduled_at', { ascending: true })
     .limit(10); // Process in batches to avoid timeout
 
   if (error) {
     console.error('[Cron] Failed to fetch transactions:', error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return addSecurityHeaders(
+      NextResponse.json({ error: error.message }, { status: 500 })
+    );
   }
 
   if (!transactions || transactions.length === 0) {
     console.log('[Cron] No pending transactions to execute');
-    return NextResponse.json({
-      message: 'No pending transactions',
-      processed: 0,
-    });
+    return addSecurityHeaders(
+      NextResponse.json({
+        message: 'No pending transactions',
+        processed: 0,
+      })
+    );
   }
 
   console.log(`[Cron] Found ${transactions.length} transactions to process`);
 
   const results: Array<{
     id: string;
-    status: 'completed' | 'failed';
+    status: 'completed' | 'failed' | 'skipped';
     signature?: string;
     error?: string;
   }> = [];
 
   for (const tx of transactions) {
+    // Skip if already executing (prevents duplicates)
+    if (executingTransactions.has(tx.id)) {
+      console.log(`[Cron] Transaction ${tx.id} is already executing, skipping`);
+      results.push({ id: tx.id, status: 'skipped', error: 'Already executing' });
+      continue;
+    }
+
+    // Acquire lock
+    executingTransactions.add(tx.id);
+
     console.log(`[Cron] Processing transaction ${tx.id}`);
 
     try {
+      // Double-check status hasn't changed (another worker might have processed it)
+      const { data: currentTx } = await supabase
+        .from('scheduled_transactions')
+        .select('status')
+        .eq('id', tx.id)
+        .single();
+
+      if (!currentTx || !['ready', 'pending'].includes(currentTx.status)) {
+        console.log(`[Cron] Transaction ${tx.id} status changed, skipping`);
+        results.push({ id: tx.id, status: 'skipped', error: 'Status changed' });
+        continue;
+      }
+
       // Update status to executing
       await supabase
         .from('scheduled_transactions')
@@ -87,21 +127,36 @@ export async function GET(request: NextRequest) {
       let signature: string;
 
       if (tx.presigned_tx_base64) {
+        // Verify nonce is still valid before sending
+        if (tx.nonce_accounts?.pubkey) {
+          const noncePubkey = new PublicKey(tx.nonce_accounts.pubkey);
+
+          try {
+            const currentNonce = await fetchNonce(noncePubkey);
+            // If we stored the nonce, verify it matches
+            if (tx.nonce_accounts.current_nonce &&
+                currentNonce !== tx.nonce_accounts.current_nonce) {
+              throw new Error('Nonce has been advanced, transaction is stale');
+            }
+          } catch (nonceError) {
+            throw new Error(`Nonce validation failed: ${nonceError}`);
+          }
+        }
+
         // Execute pre-signed durable transaction
         console.log(`[Cron] Sending pre-signed transaction for ${tx.id}`);
         signature = await sendPresignedTransaction(tx.presigned_tx_base64);
 
-        // Wait for confirmation
+        // Wait for confirmation with timeout
         const confirmed = await confirmTransaction(signature);
 
         if (!confirmed) {
           throw new Error('Transaction failed to confirm');
         }
       } else {
-        // For transactions without pre-signed tx (swaps via Jupiter DCA)
-        // In production, you would integrate with Jupiter DCA SDK here
+        // Transaction doesn't have pre-signed data
         throw new Error(
-          'Transaction requires pre-signed data or Jupiter DCA integration'
+          'Transaction requires pre-signed data. Please sign the transaction first.'
         );
       }
 
@@ -117,6 +172,14 @@ export async function GET(request: NextRequest) {
           execution_count: tx.execution_count + 1,
         })
         .eq('id', tx.id);
+
+      // Release nonce account for reuse
+      if (tx.nonce_account_id) {
+        await supabase
+          .from('nonce_accounts')
+          .update({ is_available: true })
+          .eq('id', tx.nonce_account_id);
+      }
 
       // Update Google Calendar event if connected
       if (tx.google_event_id && tx.users?.google_refresh_token) {
@@ -165,7 +228,7 @@ export async function GET(request: NextRequest) {
           nextExecution &&
           (!tx.max_executions || tx.execution_count + 1 < tx.max_executions)
         ) {
-          // Create next occurrence
+          // Create next occurrence (pending, needs to be signed)
           const { data: newTx, error: newTxError } = await supabase
             .from('scheduled_transactions')
             .insert({
@@ -183,7 +246,7 @@ export async function GET(request: NextRequest) {
               recurrence_rule: tx.recurrence_rule,
               max_executions: tx.max_executions,
               execution_count: 0,
-              status: 'pending',
+              status: 'pending', // Needs to be signed before execution
               memo: tx.memo,
               tags: tx.tags,
               google_calendar_id: tx.google_calendar_id,
@@ -204,22 +267,29 @@ export async function GET(request: NextRequest) {
       const errorMessage =
         error instanceof Error ? error.message : 'Unknown error';
 
+      // Calculate retry delay with exponential backoff
+      const retryDelays = [60, 120, 300]; // 1min, 2min, 5min
+      const currentRetryDelay = retryDelays[Math.min(tx.retry_count, retryDelays.length - 1)];
+
       // Check if we should retry
       const shouldRetry = tx.retry_count < tx.max_retries;
 
       if (shouldRetry) {
-        // Update retry count, keep as pending
+        // Update retry count, set next attempt time
+        const nextAttempt = new Date(Date.now() + currentRetryDelay * 1000);
+
         await supabase
           .from('scheduled_transactions')
           .update({
-            status: 'pending',
+            status: tx.presigned_tx_base64 ? 'ready' : 'pending',
             retry_count: tx.retry_count + 1,
             error_message: errorMessage,
+            scheduled_at: nextAttempt.toISOString(), // Delay next attempt
           })
           .eq('id', tx.id);
 
         console.log(
-          `[Cron] Transaction ${tx.id} will retry (${tx.retry_count + 1}/${tx.max_retries})`
+          `[Cron] Transaction ${tx.id} will retry in ${currentRetryDelay}s (${tx.retry_count + 1}/${tx.max_retries})`
         );
       } else {
         // Mark as failed
@@ -230,6 +300,14 @@ export async function GET(request: NextRequest) {
             error_message: errorMessage,
           })
           .eq('id', tx.id);
+
+        // Release nonce account
+        if (tx.nonce_account_id) {
+          await supabase
+            .from('nonce_accounts')
+            .update({ is_available: true })
+            .eq('id', tx.nonce_account_id);
+        }
 
         // Update calendar event to failed
         if (tx.google_event_id && tx.users?.google_refresh_token) {
@@ -265,19 +343,26 @@ export async function GET(request: NextRequest) {
         metadata: {
           retry_count: tx.retry_count + 1,
           max_retries: tx.max_retries,
+          next_retry_delay: shouldRetry ? currentRetryDelay : null,
         },
       });
 
       results.push({ id: tx.id, status: 'failed', error: errorMessage });
+    } finally {
+      // Release lock
+      executingTransactions.delete(tx.id);
     }
   }
 
   console.log(`[Cron] Processed ${results.length} transactions`);
 
-  return NextResponse.json({
-    processed: results.length,
-    results,
-  });
+  return addSecurityHeaders(
+    NextResponse.json({
+      processed: results.length,
+      results,
+      timestamp: now.toISOString(),
+    })
+  );
 }
 
 // Calculate next execution time based on RRULE
@@ -285,24 +370,29 @@ function calculateNextExecution(
   lastExecution: Date,
   rrule: string
 ): Date | null {
-  // Simple implementation for common patterns
-  // For production, use a library like rrule-js
-
   const next = new Date(lastExecution);
 
+  // Parse INTERVAL if present
+  const intervalMatch = rrule.match(/INTERVAL=(\d+)/);
+  const interval = intervalMatch ? parseInt(intervalMatch[1], 10) : 1;
+
   if (rrule.includes('FREQ=DAILY')) {
-    next.setDate(next.getDate() + 1);
+    next.setDate(next.getDate() + interval);
     return next;
   }
 
   if (rrule.includes('FREQ=WEEKLY')) {
-    const interval = rrule.includes('INTERVAL=2') ? 2 : 1;
     next.setDate(next.getDate() + 7 * interval);
     return next;
   }
 
   if (rrule.includes('FREQ=MONTHLY')) {
-    next.setMonth(next.getMonth() + 1);
+    next.setMonth(next.getMonth() + interval);
+    return next;
+  }
+
+  if (rrule.includes('FREQ=YEARLY')) {
+    next.setFullYear(next.getFullYear() + interval);
     return next;
   }
 

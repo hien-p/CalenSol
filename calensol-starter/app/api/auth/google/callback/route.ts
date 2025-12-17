@@ -1,17 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getTokensFromCode, getUserInfo } from '@/lib/google';
 import { createAdminClient } from '@/lib/supabase/server';
+import { validateAndConsumeOAuthState } from '@/lib/auth/csrf';
 
 // GET /api/auth/google/callback - Handle Google OAuth callback
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams;
   const code = searchParams.get('code');
-  const state = searchParams.get('state'); // Contains user's wallet address
+  const state = searchParams.get('state'); // Contains cryptographic nonce
   const error = searchParams.get('error');
 
   const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
 
   if (error) {
+    console.error('OAuth error from Google:', error);
     return NextResponse.redirect(
       `${baseUrl}/dashboard?error=${encodeURIComponent(error)}`
     );
@@ -25,11 +27,22 @@ export async function GET(request: NextRequest) {
 
   if (!state) {
     return NextResponse.redirect(
-      `${baseUrl}/dashboard?error=${encodeURIComponent('No wallet address in state')}`
+      `${baseUrl}/dashboard?error=${encodeURIComponent('Invalid OAuth state')}`
     );
   }
 
   try {
+    // Validate and consume OAuth state (one-time use)
+    // This retrieves the wallet address stored server-side
+    const walletAddress = await validateAndConsumeOAuthState(state);
+
+    if (!walletAddress) {
+      console.error('Invalid or expired OAuth state');
+      return NextResponse.redirect(
+        `${baseUrl}/dashboard?error=${encodeURIComponent('OAuth session expired or invalid. Please try again.')}`
+      );
+    }
+
     // Exchange code for tokens
     const tokens = await getTokensFromCode(code);
 
@@ -52,7 +65,7 @@ export async function GET(request: NextRequest) {
     const { data: existingUser } = await supabase
       .from('users')
       .select('id')
-      .eq('smart_wallet_pubkey', state)
+      .eq('smart_wallet_pubkey', walletAddress)
       .single();
 
     if (existingUser) {
@@ -66,7 +79,7 @@ export async function GET(request: NextRequest) {
           google_token_expiry: expiryDate,
           updated_at: new Date().toISOString(),
         })
-        .eq('smart_wallet_pubkey', state);
+        .eq('smart_wallet_pubkey', walletAddress);
 
       if (updateError) {
         throw updateError;
@@ -75,7 +88,7 @@ export async function GET(request: NextRequest) {
       // Create new user
       const { error: insertError } = await supabase.from('users').insert({
         email: userInfo.email,
-        smart_wallet_pubkey: state,
+        smart_wallet_pubkey: walletAddress,
         google_access_token: tokens.access_token,
         google_refresh_token: tokens.refresh_token,
         google_token_expiry: expiryDate,

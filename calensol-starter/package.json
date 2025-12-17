@@ -30,7 +30,10 @@
     "lucide-react": "^0.378.0",
     "date-fns": "^3.6.0",
     "zod": "^3.23.0",
-    "buffer": "^6.0.3"
+    "buffer": "^6.0.3",
+    "tweetnacl": "^1.0.3",
+    "bs58": "^5.0.0",
+    "rrule": "^2.8.1"
   },
   "devDependencies": {
     "typescript": "^5.4.0",
