@@ -1,0 +1,38 @@
+{
+  "name": "calensol",
+  "version": "1.0.0",
+  "description": "Calendar-Native Solana Wallet - Schedule blockchain transactions like calendar events",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "^14.2.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "@lazorkit/wallet": "^1.4.8",
+    "@coral-xyz/anchor": "^0.31.1",
+    "@solana/web3.js": "^1.91.0",
+    "@solana/spl-token": "^0.4.0",
+    "@jup-ag/dca-sdk": "^1.0.0",
+    "@supabase/ssr": "^0.3.0",
+    "@supabase/supabase-js": "^2.43.0",
+    "googleapis": "^134.0.0",
+    "tailwindcss": "^3.4.0",
+    "autoprefixer": "^10.4.0",
+    "postcss": "^8.4.0",
+    "lucide-react": "^0.378.0",
+    "date-fns": "^3.6.0",
+    "zod": "^3.23.0",
+    "buffer": "^6.0.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0"
+  }
+}
